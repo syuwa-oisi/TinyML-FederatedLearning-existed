@@ -38,8 +38,17 @@ blau_files = [file for file in os.listdir("datasets/colors") if file.startswith(
 test_montserrat_files = [file for file in os.listdir("datasets/test/") if file.startswith("montserrat")]
 test_pedraforca_files = [file for file in os.listdir("datasets/test") if file.startswith("pedraforca")]
 
-random.shuffle(montserrat_files)
-random.shuffle(pedraforca_files)
+right_files = [file for file in os.listdir("datasets/saved_dataset/train/right") if file.startswith("right")]
+left_files = [file for file in os.listdir("datasets/saved_dataset/train/left") if file.startswith("left")]
+stop_files = [file for file in os.listdir("datasets/saved_dataset/train/stop") if file.startswith("stop")]
+
+test_right_files = [file for file in os.listdir("datasets/saved_dataset/test/right") if file.startswith("right")]
+test_left_files = [file for file in os.listdir("datasets/saved_dataset/test/left") if file.startswith("left")]
+test_stop_files = [file for file in os.listdir("datasets/saved_dataset/test/stop") if file.startswith("stop")]
+
+random.shuffle(right_files)
+random.shuffle(left_files)
+random.shuffle(stop_files)
 
 # mountains = []
 # for index in range(0, len(montserrat_files), 5):
@@ -58,6 +67,10 @@ random.shuffle(pedraforca_files)
 mountains = list(sum(zip(montserrat_files, pedraforca_files), ()))
 
 test_mountains = list(sum(zip(test_montserrat_files, test_pedraforca_files), ()))
+
+new_samples = list(sum(zip(right_files, left_files, stop_files), ()))
+new_test_samples = list(sum(zip(test_right_files, test_left_files, test_stop_files), ()))
+
 # random.shuffle(vermell_files)
 # random.shuffle(verd_files)
 # random.shuffle(blau_files)
@@ -192,21 +205,21 @@ def sendSample(device, samplePath, num_button, deviceIndex, only_forward = False
 #         print(f"[{device.port}] Sending sample {filename} ({i}/{len(files)}): Button {num_button}")
 #         sendSample(device, 'datasets/mountains/'+filename, num_button, deviceIndex, True)
 def sendTestSamples(device, deviceIndex, successes_queue):
-    global test_mountains
+    global new_test_samples
 
     # print(f"[{device.port}] Sending test samples from {0} to {60}")
 
     start = deviceIndex*test_samples_amount
     end = (deviceIndex*test_samples_amount) + test_samples_amount
    
-    files = test_mountains[start:end]
+    files = new_test_samples[start:end]
    
     for i, filename in enumerate(files):
-        if (filename.startswith("montserrat")):
+        if (filename.startswith("right")):
             num_button = 1
-        elif (filename.startswith("pedraforca")):
+        elif (filename.startswith("left")):
             num_button = 2
-        elif (filename.startswith("vermell")):
+        elif (filename.startswith("stop")):
             num_button = 3
         else:
             exit("Unknown button for sample")
@@ -372,13 +385,13 @@ def FlGetModel(d, device_index, devices_hidden_layer, devices_output_layer, devi
 def sendModel(d, hidden_layer, output_layer):
     ini_time = time.time()
     for i in range(size_hidden_layer): # hidden layer
-        #d.read() # wait until confirmatio
+        d.read() # wait until confirmatio
         float_num = hidden_layer[i]
         data = struct.pack('f', float_num)
         d.write(data)
 
     for i in range(size_output_layer): # output layer
-        #d.read() # wait until confirmatio
+        d.read() # wait until confirmatio
         float_num = output_layer[i]
         data = struct.pack('f', float_num)
         d.write(data)
