@@ -1,0 +1,530 @@
+import serial
+from serial.tools.list_ports import comports
+
+import struct
+import time
+import numpy as np
+import matplotlib.pyplot as plt
+import threading
+import time
+import datetime
+import json
+import os
+import random
+from queue import Queue
+
+random.seed(4321)
+np.random.seed(4321)
+
+samples_per_device = 100 # Amount of samples of each word to send to each device
+batch_size = 1 # Must be even, hsa to be split into 2 types of samples
+experiment = 'train-test' # 'iid', 'no-iid', 'train-test', None
+use_threads = True
+
+test_samples_amount = 3
+size_hidden_nodes = 25
+size_hidden_layer = (650+1)*size_hidden_nodes
+size_output_layer = (size_hidden_nodes+1)*3
+hidden_layer = np.random.uniform(-0.5,0.5, size_hidden_layer).astype('float32')
+output_layer = np.random.uniform(-0.5, 0.5, size_output_layer).astype('float32')
+momentum = 0.9
+learningRate= 0.6
+pauseListen = False # So there are no threads reading the serial input at the same time
+
+
+right_files = [file for file in os.listdir("datasets/saved_dataset/train/right") if file.startswith("right")]
+left_files = [file for file in os.listdir("datasets/saved_dataset/train/left") if file.startswith("left")]
+stop_files = [file for file in os.listdir("datasets/saved_dataset/train/stop") if file.startswith("stop")]
+
+test_right_files = [file for file in os.listdir("datasets/saved_dataset/test/right") if file.startswith("right")]
+test_left_files = [file for file in os.listdir("datasets/saved_dataset/test/left") if file.startswith("left")]
+test_stop_files = [file for file in os.listdir("datasets/saved_dataset/test/stop") if file.startswith("stop")]
+
+print(min(len(right_files), len(left_files), len(stop_files)))
+print(min(len(test_right_files), len(test_left_files), len(test_stop_files)))
+
+random.shuffle(right_files)
+random.shuffle(left_files)
+random.shuffle(stop_files)
+
+random.shuffle(test_right_files)
+random.shuffle(test_left_files)
+random.shuffle(test_stop_files)
+
+new_samples = list(sum(zip(right_files, left_files, stop_files), ()))
+new_test_samples = list(sum(zip(test_right_files, test_left_files, test_stop_files), ()))
+
+
+log_data = {
+    "samples_per_device":samples_per_device,
+    "batch_sixze":batch_size,
+    "Experiment":experiment,
+    "Averge_millis":[],
+    "Batch_time":[],
+    "FL_time":[],
+    "devices_num_epochs":[],
+    "devices_hidden_layer":[],
+    "devices_output_layer":[],
+    "hidden_layer":[],
+    "output_layer":[],
+}
+
+def print_until_keyword(keyword, arduino):
+    while True: 
+        msg = arduino.readline().decode()
+        if msg[:-2] == keyword:
+            break
+        else:
+            print(f'({arduino.port}):',msg, end='')
+
+def init_network(hidden_layer, output_layer, device, deviceIndex):
+    device.reset_input_buffer()
+    device.write(b's')
+    print_until_keyword('start', device)
+    print(f"Sending model to {device.port}")
+
+    device.write(struct.pack('f', learningRate))
+    device.write(struct.pack('f', momentum))
+
+    for i in range(len(hidden_layer)):
+        device.read() # wait until confirmation of float received
+        float_num = hidden_layer[i]
+        data = struct.pack('f', float_num)
+        device.write(data)
+    
+    for i in range(len(output_layer)):
+        device.read() # wait until confirmation of float received
+        float_num = output_layer[i]
+        data = struct.pack('f', float_num)
+        device.write(data)
+
+    print(f"Model sent to {device.port}")
+    modelReceivedConfirmation = device.readline().decode()
+    # print(f"Model received confirmation: ", modelReceivedConfirmation)
+    
+# Batch size: The amount of samples to send
+def sendSamplesIID(device, deviceIndex, batch_size, batch_index):
+    global new_samples
+    # each_sample_amt = int(batch_size/2)
+
+    start = (deviceIndex*samples_per_device) + (batch_index * batch_size)
+    end = (deviceIndex*samples_per_device) + (batch_index * batch_size) + batch_size
+
+    print(f"[{device.port}] Sending samples from {start} to {end}")
+
+    files = new_samples[start:end]
+    for i, filename in enumerate(files):
+        filename_tmp = filename.split("_")
+        if (filename.startswith("right")):
+            num_button = 1
+        elif (filename.startswith("left")):
+            num_button = 2
+        elif (filename.startswith("stop")):
+            num_button = 3
+        else:
+            exit("Unknown button for sample")
+        print(f"[{device.port}] Sending sample {filename} (batch:{batch_index+1}/{int(samples_per_device/batch_size)})({i}/{len(files)}): Button {num_button}")
+        sendSample(device, f'datasets/saved_dataset/train/{filename_tmp[0]}/{filename}', num_button, deviceIndex)
+
+def sendSample(device, samplePath, num_button, deviceIndex, only_forward = False):
+    with open(samplePath) as f:
+        ini_time = time.time() * 1000
+        data = json.load(f)
+        print("write t")
+        device.write(b't')
+        startConfirmation = device.readline().decode()
+        print(f"[{device.port}] Train start confirmation:", startConfirmation)
+
+        device.write(struct.pack('B', num_button))
+        device.readline().decode() # Button confirmation
+
+        device.write(struct.pack('B', 1 if only_forward else 0))
+        print(f"Only forward confirmation: {device.readline().decode()}") # Button confirmation
+        print(len(data['payload']['values']))
+        for i, value in enumerate(data['payload']['values']):
+            device.write(struct.pack('h', value))
+            device.flush()
+
+        print(f"[{device.port}] Sample received confirmation:", device.readline().decode())
+        device.readline().decode() # Accept 'graph' command
+        error, num_button_predicted = read_graph(device, deviceIndex)
+        if (error > 0.28):
+            print(f"[{device.port}] Sample {samplePath} generated an error of {error}")
+        print(f'Sample sent in: {(time.time()*1000)-ini_time} milliseconds)')
+    
+    print(f"{num_button} - {num_button_predicted}")
+    return error, num_button == num_button_predicted
+
+def sendTestSamples(device, deviceIndex, successes_queue):
+    global new_test_samples
+
+    start = deviceIndex*test_samples_amount
+    end = (deviceIndex*test_samples_amount) + test_samples_amount
+   
+    files = new_test_samples[start:end]
+   
+    for i, filename in enumerate(files):
+        filename_tmp = filename.split("_")
+        if (filename.startswith("right")):
+            num_button = 1
+        elif (filename.startswith("left")):
+            num_button = 2
+        elif (filename.startswith("stop")):
+            num_button = 3
+        else:
+            exit("Unknown button for sample")
+        print(f"[{device.port}] Sending Test sample {filename} ({i}/{len(files)}): Button {num_button}")
+        
+        error, success = sendSample(device, f'datasets/saved_dataset/test/{filename_tmp[0]}/{filename}', num_button, deviceIndex, True)
+        successes_queue.put(success)
+
+def read_graph(device, deviceIndex):
+    global repaint_graph
+
+    outputs = device.readline().decode().split()
+    print(f'Ouptuts: {outputs}')
+
+    bpred = outputs.index(max(outputs))+1
+    print(f'Predicted button: {bpred}')
+
+    print(f"Outputs: ", outputs)
+    
+
+    error = device.readline().decode()
+    print(f"Error: ", error)
+
+    ne = device.readline()[:-2]
+    n_epooch = int(ne)
+
+    n_error = device.read(4)
+    [n_error] = struct.unpack('f', n_error)
+    nb = device.readline()[:-2]
+    graph.append([n_epooch, n_error, deviceIndex])
+    repaint_graph = True
+    return n_error, outputs.index(max(outputs)) + 1
+
+def read_number(msg):
+    while True:
+        try:
+            #return 2;
+            return int(input(msg))
+        except:
+            print("ERROR: Not a number")
+
+def read_port(msg):
+    while True:
+        try:
+            port = input(msg)
+            #port = "COM3";
+            ser = serial.Serial(port, 9600)
+            ser.close()
+            ser.open()
+            return ser
+        except:
+            print(f"ERROR: Wrong port connection ({port})")
+
+first_paint = True
+graph = []
+repaint_graph = True
+def plot_graph():
+    global graph, repaint_graph, devices, first_paint
+
+    if (repaint_graph):
+        colors = ['r', 'g', 'b', 'y']
+        markers = ['-', '--', ':', '-.']
+        #devices =  [x[2] for x in graph]
+        epochs = 1
+        for device_index, device in enumerate(devices):
+            epoch = [x[0] for x in graph if x[2] == device_index]
+            error = [x[1] for x in graph if x[2] == device_index]
+
+            epochs = max(len(error), epochs)
+        
+            plt.plot(error, colors[device_index] + markers[device_index], label=f"Device {device_index}")
+
+        if (first_paint):
+            plt.legend()
+            plt.xlim(left=0)
+            plt.ylim(bottom=0, top=0.7)
+            plt.ylabel('Loss') # or Error
+            plt.xlabel('Epoch')
+            first_paint = False
+        # plt.axes().set_ylim([0, 0.6])
+        # plt.xlim(bottom=0)
+        plt.autoscale(axis='x')
+        #plt.xlim = epochs
+        #plt.xticks(range(0, epochs))
+
+        if (experiment == 'train-test'):
+            plt.axvline(x=samples_per_device)
+
+        repaint_graph = False
+
+    plt.pause(2)
+
+    
+
+def listenDevice(device, deviceIndex):
+    global pauseListen, graph
+    while True:
+        while (pauseListen):
+            time.sleep(0.1)
+
+        d.timeout = None
+        msg = device.readline().decode()
+        if (len(msg) > 0):
+            print(f'({device.port}):', msg, end="")
+            # Modified to graph
+            if msg[:-2] == 'graph':
+                read_graph(device, deviceIndex)
+
+            elif msg[:-2] == 'start_fl':
+                startFL()
+
+def getDevices():
+    global devices, devices_connected
+    num_devices = read_number("Number of devices: ")
+
+    available_ports = comports()
+    print("Available ports:")
+    for available_port in available_ports:
+        print(available_port)
+
+    devices = [read_port(f"Port device_{i+1}: ") for i in range(num_devices)]
+    devices_connected = devices
+
+def FlGetModel(d, device_index, devices_hidden_layer, devices_output_layer, devices_num_epochs, old_devices_connected):
+    global size_hidden_layer, size_output_layer
+    d.reset_input_buffer()
+    d.reset_output_buffer()
+    d.timeout = 5
+
+    print(f'Starting connection to {d.port} ...') # Hanshake
+    d.write(b'>') # Python --> SYN --> Arduino
+    if d.read() == b'<': # Python <-- SYN ACK <-- Arduino
+        d.write(b's') # Python --> ACK --> Arduino
+        
+        print('Connection accepted.')
+        devices_connected.append(d)
+        #devices_hidden_layer = np.vstack((devices_hidden_layer, np.empty(size_hidden_layer)))
+        #devices_output_layer = np.vstack((devices_output_layer, np.empty(size_output_layer)))
+        d.timeout = None
+
+        print_until_keyword('start', d)
+        devices_num_epochs.append(int(d.readline()[:-2]))
+
+        print(f'Receiving model from {d.port} ...')
+        ini_time = time.time()
+
+        for i in range(size_hidden_layer): # hidden layer
+            data = d.read(4)
+            [float_num] = struct.unpack('f', data)
+            if np.isnan(float_num):
+                print("num")
+                print(data)
+                print(float_num)
+                time.sleep(10000)
+            elif float_num>100:
+                print("over")
+                print(data)
+                print(float_num)
+            devices_hidden_layer[device_index][i] = float_num
+
+        for i in range(size_output_layer): # output layer
+            data = d.read(4)
+            [float_num] = struct.unpack('f', data)
+            devices_output_layer[device_index][i] = float_num
+
+        print(f'Model received from {d.port} ({time.time()-ini_time} seconds)')
+
+        # if it was not connected before, we dont use the devices' model
+        if not d in old_devices_connected:
+            devices_num_epochs[device_index] = 0
+            print(f'Model not used. The device {d.port} has an outdated model')
+
+    else:
+        print(f'Connection timed out. Skipping {d.port}.')
+
+def sendModel(d, hidden_layer, output_layer):
+    ini_time = time.time()
+    for i in range(size_hidden_layer): # hidden layer
+        d.read() # wait until confirmatio
+        float_num = hidden_layer[i]
+        data = struct.pack('f', float_num)
+        d.write(data)
+
+    for i in range(size_output_layer): # output layer
+        d.read() # wait until confirmatio
+        float_num = output_layer[i]
+        data = struct.pack('f', float_num)
+        d.write(data)
+
+    print(f'Model sent to {d.port} ({time.time()-ini_time} seconds)')
+
+def startFL():
+    global devices_connected, hidden_layer, output_layer, pauseListen
+
+    pauseListen = True
+
+    print('Starting Federated Learning')
+    old_devices_connected = devices_connected
+    devices_connected = []
+    devices_hidden_layer = np.empty((len(devices), size_hidden_layer), dtype='float32')
+    devices_output_layer = np.empty((len(devices), size_output_layer), dtype='float32')
+    devices_num_epochs = []
+
+    ##################
+    # Receiving models
+    ##################
+    threads = []
+    for i, d in enumerate(devices):
+        if use_threads:
+            thread = threading.Thread(target=FlGetModel, args=(d, i, devices_hidden_layer, devices_output_layer, devices_num_epochs, old_devices_connected))
+            thread.daemon = True
+            thread.start()
+            threads.append(thread)
+        else:
+            FlGetModel(d, i, devices_hidden_layer, devices_output_layer, devices_num_epochs, old_devices_connected)
+ 
+    for thread in threads: thread.join() # Wait for all the threads to end
+
+    
+    ####################
+    # Processing models
+    ####################
+
+    log_data["devices_num_epochs"].append(devices_num_epochs)
+    # if sum == 0, any device made any epoch
+    if sum(devices_num_epochs) > 0:
+        # We can use weights to change the importance of each device
+        # example weights = [1, 0.5] -> giving more importance to the first device...
+        # is like percentage of importance :  sum(a * weights) / sum(weights)
+        ini_time = time.time() * 1000
+        log_data["devices_hidden_layer"].append(devices_hidden_layer.tolist())
+        log_data["devices_output_layer"].append(devices_output_layer.tolist())
+        hidden_layer = np.average(devices_hidden_layer, axis=0, weights=devices_num_epochs)
+        output_layer = np.average(devices_output_layer, axis=0, weights=devices_num_epochs)
+        log_data["hidden_layer"].append(hidden_layer.tolist())
+        log_data["output_layer"].append(output_layer.tolist())
+        print(f'Average millis: {(time.time()*1000)-ini_time} milliseconds')
+        log_data["Averge_millis"].append((time.time()*1000)-ini_time)
+
+
+    #################
+    # Sending models
+    #################
+    threads = []
+    for d in devices_connected:
+        print(f'Sending model to {d.port} ...')
+
+        if use_threads:
+            thread = threading.Thread(target=sendModel, args=(d, hidden_layer, output_layer))
+            thread.daemon = True
+            thread.start()
+            threads.append(thread)
+        else:
+            sendModel(d, hidden_layer, output_layer)
+    for thread in threads: thread.join() # Wait for all the threads to end
+    pauseListen = False
+
+
+getDevices()
+
+# To load a Pre-trained model
+# hidden_layer = np.load("./hidden_montserrat.npy")
+# output_layer = np.load("./output_montserrat.npy")
+
+
+# Send the blank model to all the devices
+threads = []
+for i, d in enumerate(devices):
+    if use_threads:
+        thread = threading.Thread(target=init_network, args=(hidden_layer, output_layer, d, i))
+        thread.daemon = True
+        thread.start()
+        threads.append(thread)
+    else:
+        init_network(hidden_layer, output_layer, d, i)
+for thread in threads: thread.join() # Wait for all the threads to end
+
+if experiment != None:
+    train_ini_time = time.time()
+    # Train the device
+    for batch in range(int(samples_per_device/batch_size)):
+        batch_ini_time = time.time()
+        for deviceIndex, device in enumerate(devices):
+            if experiment == 'iid' or experiment == 'train-test':
+                method = sendSamplesIID            
+
+            if use_threads:
+                thread = threading.Thread(target=method, args=(device, deviceIndex, batch_size, batch))
+                thread.daemon = True
+                thread.start()
+                threads.append(thread)
+            else:
+                method(device, deviceIndex, batch_size, batch)
+        for thread in threads: thread.join() # Wait for all the threads to end
+        print(f'Batch time: {time.time() - batch_ini_time} seconds')
+        log_data["Batch_time"].append(time.time() - batch_ini_time)
+        fl_ini_time = time.time()
+        startFL()
+        print(f'FL time: {time.time() - fl_ini_time} seconds')
+        log_data["FL_time"].append(time.time() - fl_ini_time)
+
+    train_time = time.time()-train_ini_time
+    log_data["train_time"]=train_time
+
+    if experiment == 'train-test':
+        successes_queue = Queue()
+        for deviceIndex, device in enumerate(devices):
+            if use_threads:
+                thread = threading.Thread(target=sendTestSamples, args=(device, deviceIndex, successes_queue))
+                thread.daemon = True
+                thread.start()
+                threads.append(thread)
+            else:
+                sendTestSamples(device, deviceIndex, successes_queue)
+        for thread in threads: thread.join() # Wait for all the threads to end
+
+        test_accuracy = sum(successes_queue.queue)/len(successes_queue.queue)
+        print(f"Testing accuracy: {test_accuracy}")
+        print(f"{test_accuracy}, ", end = '')
+        log_data["testing_accuracy"]=test_accuracy
+
+
+
+plt.ion()
+# plt.title(f"Loss vs Epoch")
+plt.show()
+
+font_sm = 13
+font_md = 16
+font_xl = 18
+plt.rc('font', size=font_sm)          # controls default text sizes
+plt.rc('axes', titlesize=font_sm)     # fontsize of the axes title
+plt.rc('axes', labelsize=font_md)     # fontsize of the x and y labels
+plt.rc('xtick', labelsize=font_sm)    # fontsize of the tick labels
+plt.rc('ytick', labelsize=font_sm)    # fontsize of the tick labels
+plt.rc('legend', fontsize=font_sm)    # legend fontsize
+plt.rc('figure', titlesize=font_xl)   # fontsize of the figure title
+
+plot_graph()
+
+if experiment != None:
+    figname = f"commands_log/fig/SS{samples_per_device}-BS{batch_size}-LR{learningRate}-M{momentum}-HL{size_hidden_nodes}-TT{train_time}-{experiment}.png"
+    plt.savefig(figname, format='png')
+    print(f"Generated {figname}")
+    with open(f"commands_log/json/SS{samples_per_device}-BS{batch_size}-LR{learningRate}-M{momentum}-HL{size_hidden_nodes}-TT{train_time}-{experiment}-"+str(datetime.datetime.now()).replace(":","-").replace(" ","-"),"w") as f:
+        json.dump(log_data,f)
+
+# Listen their updates
+for i, d in enumerate(devices):
+    thread = threading.Thread(target=listenDevice, args=(d, i))
+    thread.daemon = True
+    thread.start()
+
+while True:
+    #if (repaint_graph): 
+    plot_graph()
+        #repaint_graph = False
+    # time.sleep(0.1)

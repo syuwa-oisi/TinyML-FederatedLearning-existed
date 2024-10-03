@@ -265,7 +265,10 @@ def read_port(msg):
         try:
             port = input(msg)
             #port = "COM3";
-            return serial.Serial(port, 9600)
+            ser = serial.Serial(port, 9600)
+            ser.close()
+            ser.open()
+            return ser
         except:
             print(f"ERROR: Wrong port connection ({port})")
 

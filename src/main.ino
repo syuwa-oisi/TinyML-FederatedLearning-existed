@@ -365,7 +365,13 @@ void loop()
             {
                 while (Serial.available() < 2)
                 {
+                    digitalWrite(LEDR, LOW); //  ON
+                    digitalWrite(LEDG, LOW); //  ON
+                    digitalWrite(LEDB, LOW); //  ON
                 }
+                digitalWrite(LEDR, HIGH); //  ON
+                digitalWrite(LEDG, HIGH); //  ON
+                digitalWrite(LEDB, HIGH); //  ON
                 Serial.readBytes(ref, 2);
                 inference.buffer[i] = 0;
                 inference.buffer[i] = (ref[1] << 8) | ref[0];
